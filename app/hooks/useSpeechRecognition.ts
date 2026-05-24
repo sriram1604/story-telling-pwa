@@ -3,16 +3,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { LanguageCode } from '../types';
 
-// ─── Augment Window for Web Speech API ───────────────────────────────────────
-declare global {
-  interface Window {
-    SpeechRecognition: typeof useSpeechRecognition | undefined;
-    webkitSpeechRecognition: typeof useSpeechRecognition | undefined;
-  }
-}
-
 export interface UseSpeechRecognitionReturn {
   isListening: boolean;
+  isProcessing: boolean;
   transcript: string;
   interimTranscript: string;
   error: string | null;
@@ -21,101 +14,39 @@ export interface UseSpeechRecognitionReturn {
   stopListening: () => void;
   setTranscript: (val: string) => void;
   clearTranscript: () => void;
-  volume: number; // useful for UI waveform
+  volume: number;
 }
 
 export function useSpeechRecognition(
   language: LanguageCode,
   onSilenceDetected?: () => void
 ): UseSpeechRecognitionReturn {
-  const [isListening, setIsListening]             = useState(false);
-  const [transcript, setTranscriptState]          = useState('');
+  const [isListening, setIsListening] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [transcript, setTranscriptState] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
-  const [error, setError]                         = useState<string | null>(null);
-  const [isSupported, setIsSupported]             = useState(false);
-  const [volume, setVolume]                       = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [volume, setVolume] = useState(0);
 
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const languageRef    = useRef<LanguageCode>(language);
+  // We consider it supported if MediaRecorder is available
+  const isSupported = typeof window !== 'undefined' && !!window.navigator?.mediaDevices?.getUserMedia;
 
-  // Web Audio API refs for silence detection
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  
+  // Audio Context for Silence Detection
   const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef     = useRef<AnalyserNode | null>(null);
-  const streamRef       = useRef<MediaStream | null>(null);
-  const sourceRef       = useRef<MediaStreamAudioSourceNode | null>(null);
-  const animationRef    = useRef<number | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animationRef = useRef<number | null>(null);
   const silenceStartRef = useRef<number | null>(null);
-
-  // Silence threshold config - increased to 15 to account for ambient noise floor
-  const SILENCE_THRESHOLD = 15; 
+  
+  // Silence threshold config
+  const SILENCE_THRESHOLD = 10; 
   const SILENCE_DURATION_MS = 2000; // 2 seconds of silence
 
-  useEffect(() => {
-    languageRef.current = language;
-    if (recognitionRef.current && isListening) {
-      recognitionRef.current.lang = language;
-    }
-  }, [language, isListening]);
-
-  useEffect(() => {
-    const SpeechRecognitionImpl =
-      window.SpeechRecognition ?? window.webkitSpeechRecognition;
-
-    if (!SpeechRecognitionImpl) {
-      setIsSupported(false);
-      return;
-    }
-    setIsSupported(true);
-
-    const recognition = new SpeechRecognitionImpl();
-    recognition.continuous      = true;
-    recognition.interimResults  = true;
-    recognition.maxAlternatives = 1;
-    recognition.lang            = languageRef.current;
-
-    recognition.onstart = () => { setIsListening(true); setError(null); };
-    
-    // When recognition ends natively, also update state
-    recognition.onend   = () => { 
-      setIsListening(false); 
-      setInterimTranscript('');
-      cleanupAudio();
-    };
-
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      setIsListening(false);
-      const msgs: Record<string, string> = {
-        'not-allowed':         'Microphone access denied.',
-        'service-not-allowed': 'Microphone access denied.',
-        'no-speech':           'No speech detected.',
-        'network':             'Network error.',
-      };
-      setError(msgs[event.error] ?? `Speech recognition error: ${event.error}`);
-    };
-
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      let finalText   = '';
-      let interimText = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i];
-        if (r.isFinal) finalText   += r[0].transcript + ' ';
-        else           interimText += r[0].transcript;
-      }
-      if (finalText) setTranscriptState(prev => (prev + ' ' + finalText).trim());
-      setInterimTranscript(interimText);
-    };
-
-    recognitionRef.current = recognition;
-    return () => { recognition.abort(); recognitionRef.current = null; };
-  }, []);
-
-  // Cleanup audio resources
   const cleanupAudio = useCallback(() => {
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
     if (analyserRef.current) {
       analyserRef.current.disconnect();
       analyserRef.current = null;
@@ -128,25 +59,100 @@ export function useSpeechRecognition(
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
     setVolume(0);
   }, []);
 
+  const processAudio = async (audioBlob: Blob) => {
+    setIsProcessing(true);
+    setInterimTranscript('Processing audio...');
+    setError(null);
+    
+    try {
+      const formData = new FormData();
+      // Whisper supports multiple formats. We use the blob's actual type.
+      formData.append('file', audioBlob, 'audio.webm'); 
+      formData.append('language', language); 
+
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Failed to process audio (${res.status})`);
+      }
+
+      const data = await res.json();
+      if (data.text) {
+        setTranscriptState(prev => (prev + ' ' + data.text).trim());
+      }
+    } catch (err: any) {
+      console.error('Transcription error:', err);
+      setError(err.message || 'Failed to process audio');
+    } finally {
+      setIsProcessing(false);
+      setInterimTranscript('');
+      setIsListening(false);
+      cleanupAudio();
+    }
+  };
+
   const stopListening = useCallback(() => {
-    recognitionRef.current?.stop(); // This triggers onend which calls cleanupAudio
-    setIsListening(false);
-  }, []);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop(); // Triggers onstop event -> processes audio
+    } else {
+      setIsListening(false);
+      cleanupAudio();
+    }
+  }, [cleanupAudio]);
 
   const startListening = useCallback(async () => {
-    if (!recognitionRef.current) return;
     setError(null);
-    setInterimTranscript('');
-    recognitionRef.current.lang = languageRef.current;
+    setInterimTranscript('Listening...');
+    audioChunksRef.current = [];
 
     try {
-      // 1. Get audio stream for silence detection
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
       streamRef.current = stream;
 
+      // 1. Setup MediaRecorder
+      let mimeType = '';
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus';
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4'; // iOS Safari fallback
+      }
+      
+      const mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        // Construct the blob from recorded chunks
+        const type = mediaRecorder.mimeType || 'audio/webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type });
+        processAudio(audioBlob);
+      };
+
+      mediaRecorder.start(100); // collect chunks every 100ms
+      setIsListening(true);
+
+      // 2. Setup Silence Detection
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       audioContextRef.current = audioCtx;
 
@@ -157,7 +163,6 @@ export function useSpeechRecognition(
 
       const source = audioCtx.createMediaStreamSource(stream);
       source.connect(analyser);
-      sourceRef.current = source;
 
       const bufferLength = analyser.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
@@ -167,7 +172,6 @@ export function useSpeechRecognition(
         if (!analyserRef.current) return;
         analyserRef.current.getByteFrequencyData(dataArray);
 
-        // Calculate average volume
         let sum = 0;
         for (let i = 0; i < bufferLength; i++) {
           sum += dataArray[i];
@@ -179,13 +183,12 @@ export function useSpeechRecognition(
           if (!silenceStartRef.current) {
             silenceStartRef.current = performance.now();
           } else if (performance.now() - silenceStartRef.current > SILENCE_DURATION_MS) {
-            // Silence detected! Stop everything.
+            // Silence detected -> Stop recording
             stopListening();
             if (onSilenceDetected) onSilenceDetected();
-            return; // Stop the loop
+            return; // Exit loop
           }
         } else {
-          // Reset silence timer if volume goes above threshold
           silenceStartRef.current = null;
         }
 
@@ -194,15 +197,18 @@ export function useSpeechRecognition(
 
       checkSilence();
 
-      // 2. Start Web Speech API
-      recognitionRef.current.start();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Audio initialization failed', err);
-      setError('Could not access microphone for silence detection.');
-      // Fallback: just start recognition if getUserMedia fails
-      try { recognitionRef.current.start(); } catch { /* already started */ }
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setError('Microphone access denied. Please allow permissions.');
+      } else {
+        setError('Could not access microphone.');
+      }
+      setIsListening(false);
+      setInterimTranscript('');
+      cleanupAudio();
     }
-  }, [stopListening, onSilenceDetected]);
+  }, [stopListening, onSilenceDetected, cleanupAudio, language]);
 
   const setTranscript = useCallback((val: string) => {
     setTranscriptState(val);
@@ -213,8 +219,15 @@ export function useSpeechRecognition(
     setInterimTranscript('');
   }, []);
 
+  useEffect(() => {
+    return () => {
+      cleanupAudio();
+    };
+  }, [cleanupAudio]);
+
   return {
     isListening,
+    isProcessing,
     transcript,
     interimTranscript,
     error,
@@ -226,5 +239,3 @@ export function useSpeechRecognition(
     volume,
   };
 }
-
-
