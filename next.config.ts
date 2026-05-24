@@ -18,4 +18,5 @@ const pwaConfig = withPWA({
   skipWaiting: true,
 }) 
 
+// @ts-expect-error next-pwa type mismatch with Next.js 15
 export default pwaConfig(nextConfig);
